@@ -135,10 +135,10 @@ FRONTEND_PATTERNS = {
 
 # --- Helper Functions ---
 
-def make_request(url):
+def make_request(url, verbose=False): # Added verbose flag
     """Makes an HTTP GET request to the URL."""
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 BackReconTool/1.6'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 BackReconTool/1.7' # Version bump
     }
     try:
         requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
@@ -155,16 +155,19 @@ def make_request(url):
 
         if not parsed_url.scheme:
             target_url_https = 'https://' + url
+            if verbose: print(f"[*] [{target_display}] No scheme provided. Trying {target_url_https}")
             try:
-                response = session.get(target_url_https, timeout=15, verify=True, allow_redirects=True) # Increased timeout slightly
+                response = session.get(target_url_https, timeout=15, verify=True, allow_redirects=True)
                 response.raise_for_status()
             except requests.exceptions.SSLError as ssl_err:
-                 print(f"[*] [{target_display}] HTTPS SSL error: {ssl_err}. Trying HTTP...")
+                 # Show error only if verbose
+                 if verbose: print(f"[*] [{target_display}] HTTPS SSL error: {ssl_err}. Trying HTTP...")
                  target_url_http = f'http://{parsed_url.netloc}{parsed_url.path or "/"}' + (f"?{parsed_url.query}" if parsed_url.query else "")
                  response = session.get(target_url_http, timeout=15, verify=False, allow_redirects=True)
                  response.raise_for_status()
             except requests.exceptions.RequestException as req_err:
-                print(f"[*] [{target_display}] HTTPS failed: {req_err}. Trying HTTP...")
+                # Show error only if verbose
+                if verbose: print(f"[*] [{target_display}] HTTPS failed: {req_err}. Trying HTTP...")
                 target_url_http = f'http://{parsed_url.netloc}{parsed_url.path or "/"}' + (f"?{parsed_url.query}" if parsed_url.query else "")
                 response = session.get(target_url_http, timeout=15, verify=False, allow_redirects=True)
                 response.raise_for_status()
@@ -173,11 +176,13 @@ def make_request(url):
                  response = session.get(url, timeout=15, verify=True, allow_redirects=True)
                  response.raise_for_status()
              except requests.exceptions.SSLError as ssl_err:
-                 print(f"[*] [{target_display}] SSL verification failed: {ssl_err}. Retrying without verification...")
+                 # Show error only if verbose
+                 if verbose: print(f"[*] [{target_display}] SSL verification failed: {ssl_err}. Retrying without verification...")
                  response = session.get(url, timeout=15, verify=False, allow_redirects=True)
                  response.raise_for_status()
              except requests.exceptions.RequestException as req_err:
-                 print(f"[!] [{target_display}] Error fetching: {req_err}")
+                 # Show error only if verbose
+                 if verbose: print(f"[!] [{target_display}] Error fetching: {req_err}")
                  status = None
                  if hasattr(req_err, 'response') and req_err.response is not None: status = req_err.response.status_code
                  return None, None, url, None, status
@@ -187,39 +192,45 @@ def make_request(url):
             response.encoding = response.apparent_encoding
             content = response.text
         except Exception as enc_err:
-             print(f"[!] [{target_display}] Warning: Encoding error: {enc_err}. Using response.text directly.")
+             # Show error only if verbose
+             if verbose: print(f"[!] [{target_display}] Warning: Encoding error: {enc_err}. Using response.text directly.")
              try: content = response.text
-             except Exception as text_err: print(f"[!] [{target_display}] Error accessing response.text: {text_err}"); content = ""
+             except Exception as text_err:
+                 if verbose: print(f"[!] [{target_display}] Error accessing response.text: {text_err}")
+                 content = ""
 
         return response.headers, content, response.url, response.cookies, response.status_code
 
     except requests.exceptions.Timeout:
-        print(f"[!] [{target_display}] Error: Request timed out."); return None, None, url, None, "Timeout"
+        if verbose: print(f"[!] [{target_display}] Error: Request timed out.")
+        return None, None, url, None, "Timeout"
     except requests.exceptions.TooManyRedirects:
-        print(f"[!] [{target_display}] Error: Exceeded maximum redirects."); return None, None, url, None, "Too Many Redirects"
+        if verbose: print(f"[!] [{target_display}] Error: Exceeded maximum redirects.")
+        return None, None, url, None, "Too Many Redirects"
     except requests.exceptions.RequestException as e:
-        print(f"[!] [{target_display}] Error fetching: {e}")
+        if verbose: print(f"[!] [{target_display}] Error fetching: {e}")
         status = "Request Error";
         if hasattr(e, 'response') and e.response is not None: status = e.response.status_code
         return None, None, url, None, status
     except Exception as e:
-        print(f"[!] [{target_display}] An unexpected error occurred: {e}"); return None, None, url, None, "Unexpected Error"
+        if verbose: print(f"[!] [{target_display}] An unexpected error occurred: {e}")
+        return None, None, url, None, "Unexpected Error"
     finally:
         session.close()
 
 
 # --- Detection Logic ---
-# (detect_cms, detect_backend, detect_frontend remain unchanged)
-def detect_cms(headers, html_content, url, cookies):
+
+def detect_cms(headers, html_content, url, cookies, verbose=False): # Added verbose
     """Detects CMS based on patterns, attempting to extract versions."""
     detected_cms = {} # Use dict: { 'CMS Name': 'version' or None }
     if not html_content: return detected_cms
     target_display = url[:50] + "..." if len(url) > 50 else url # For logging
 
     try:
-        soup = BeautifulSoup(html_content, 'html.parser')
+        soup = BeautifulSoup(html_content, 'lxml') # Use lxml parser
     except Exception as e:
-        # print(f"[!] [{target_display}] Error parsing HTML for CMS detection: {e}") # Reduce noise
+        if verbose: print(f"[!] [{target_display}] Error parsing HTML for CMS detection: {e}")
         return detected_cms
 
     for cms_name, patterns in CMS_PATTERNS.items():
@@ -231,7 +242,7 @@ def detect_cms(headers, html_content, url, cookies):
             match_found = False
             try:
                 if ptype == 'meta':
-                    meta_tags = soup.find_all('meta', attrs={'name': pattern_info['name']})
+                    meta_tags = soup.select(f'meta[name="{pattern_info["name"]}"]')
                     for tag in meta_tags:
                         content = tag.get('content', '')
                         if content:
@@ -242,13 +253,10 @@ def detect_cms(headers, html_content, url, cookies):
                                     version = match.group(pattern_info['version_group'])
                                 break
                 elif ptype == 'path':
-                    elements = soup.find_all(['a', 'link', 'script', 'img'], src=True) + soup.find_all(['a', 'link'], href=True)
-                    for element in elements:
-                        resource_url = element.get('src') or element.get('href')
-                        if isinstance(resource_url, str) and pattern_info['pattern'] in resource_url:
-                            match_found = True; break
+                    elements = soup.select('a[href*="{0}"], link[href*="{0}"], script[src*="{0}"], img[src*="{0}"]'.format(pattern_info['pattern']))
+                    if elements:
+                        match_found = True; break
                 elif ptype == 'header':
-                    # Ensure headers is not None before accessing
                     if headers is not None:
                         header_value = headers.get(pattern_info['name'])
                         if header_value:
@@ -257,7 +265,6 @@ def detect_cms(headers, html_content, url, cookies):
                                 match_found = True
                                 if 'version_group' in pattern_info and len(match.groups()) >= pattern_info['version_group'] and match.group(pattern_info['version_group']):
                                     version = match.group(pattern_info['version_group'])
-                                # Don't break here for headers
                 elif ptype == 'cookie':
                      if cookies:
                         for cookie in cookies:
@@ -267,26 +274,25 @@ def detect_cms(headers, html_content, url, cookies):
                             elif pattern_info['name'] == cookie.name: is_match = True
                             if is_match: match_found = True; break
                 elif ptype == 'script':
-                     # Check if pattern is regex or string
                      pattern_re = pattern_info['pattern'] if isinstance(pattern_info['pattern'], re.Pattern) else re.compile(pattern_info['pattern'], re.IGNORECASE)
-                     scripts = soup.find_all('script', src=pattern_re)
+                     scripts = soup.select(f'script[src*="{pattern_info["pattern"]}"]')
                      if scripts: match_found = True
                 elif ptype == 'html':
                      if isinstance(html_content, str) and re.search(pattern_info['pattern'], html_content, re.IGNORECASE | re.DOTALL):
                          match_found = True
 
                 if match_found:
-                    # Update only if CMS not found yet, or if we just found a version for it
                     if cms_name not in detected_cms or (version and detected_cms[cms_name] is None):
                          detected_cms[cms_name] = version
-                    if version: # If we found a version, we can often stop checking patterns for this CMS
-                        break # Break inner loop (patterns)
+                    if version:
+                        break
 
             except Exception as e:
-                pass # Silently continue for now
-                continue
+                # Print specific pattern error only if verbose
+                if verbose: print(f"[!] [{target_display}] Error during CMS detection pattern ({cms_name} - {ptype}): {e}")
+                continue # Try next pattern
 
-            if cms_name in detected_cms and detected_cms[cms_name]: break # Break outer loop if version found
+            if cms_name in detected_cms and detected_cms[cms_name]: break
 
     formatted_cms = []
     for name, ver in detected_cms.items():
@@ -294,7 +300,7 @@ def detect_cms(headers, html_content, url, cookies):
     return formatted_cms
 
 
-def detect_backend(headers, cookies, url):
+def detect_backend(headers, cookies, url, verbose=False): # Added verbose
     """Detects backend technologies based on headers and cookies, extracting versions."""
     detected_backend = {} # Use dict: { 'Tech Name': 'version' or None }
     if headers is None: headers = {}
@@ -302,7 +308,7 @@ def detect_backend(headers, cookies, url):
     target_display = url[:50] + "..." if len(url) > 50 else url # For logging
 
     for tech_name, patterns in BACKEND_PATTERNS.items():
-        if tech_name in detected_backend and detected_backend[tech_name] is not None: continue # Skip if already found with version
+        if tech_name in detected_backend and detected_backend[tech_name] is not None: continue
 
         for pattern_info in patterns:
             ptype = pattern_info['type']
@@ -317,24 +323,22 @@ def detect_backend(headers, cookies, url):
                             match_found = True
                             if 'version_group' in pattern_info and len(match.groups()) >= pattern_info['version_group'] and match.group(pattern_info['version_group']):
                                 version = match.group(pattern_info['version_group'])
-                            # Don't break inner loop for headers yet
                 elif ptype == 'cookie':
                     for cookie in cookies:
-                        # Simple string comparison for cookie names
                         if pattern_info['name'] == cookie.name:
                             match_found = True; break
 
                 if match_found:
                     if tech_name not in detected_backend or (version and detected_backend[tech_name] is None):
                          detected_backend[tech_name] = version
-                    if version: # If we found a version, break inner loop (patterns)
+                    if version:
                         break
 
             except Exception as e:
-                pass
+                if verbose: print(f"[!] [{target_display}] Error during Backend detection pattern ({tech_name} - {ptype}): {e}")
                 continue
 
-            if tech_name in detected_backend and detected_backend[tech_name]: break # Break outer loop if version found
+            if tech_name in detected_backend and detected_backend[tech_name]: break
 
     formatted_backend = []
     for name, ver in detected_backend.items():
@@ -342,18 +346,18 @@ def detect_backend(headers, cookies, url):
     return formatted_backend
 
 
-def detect_frontend(html_content, url):
+def detect_frontend(html_content, url, verbose=False): # Added verbose
     """Detects frontend libraries, attempting to extract versions from filenames/attributes."""
     detected_frontend = {} # Use dict: { 'Lib Name': 'version' or None }
     if not isinstance(html_content, str) or not html_content:
-         return detected_frontend # Return empty dict
+         return detected_frontend
     target_display = url[:50] + "..." if len(url) > 50 else url # For logging
 
     try:
-        soup = BeautifulSoup(html_content, 'html.parser')
+        soup = BeautifulSoup(html_content, 'lxml') # Use lxml parser
     except Exception as e:
-        # print(f"[!] [{target_display}] Error parsing HTML for Frontend detection: {e}") # Reduce noise
-        return detected_frontend # Return empty dict
+        if verbose: print(f"[!] [{target_display}] Error parsing HTML for Frontend detection: {e}")
+        return detected_frontend
 
     scripts = soup.find_all('script')
     script_sources = [s.get('src') for s in scripts if s.get('src')]
@@ -361,7 +365,7 @@ def detect_frontend(html_content, url):
     css_links = [link.get('href') for link in soup.find_all('link', rel='stylesheet') if link.get('href')]
 
     for lib_name, patterns in FRONTEND_PATTERNS.items():
-        if lib_name in detected_frontend and detected_frontend[lib_name] is not None: continue # Skip if already found with version
+        if lib_name in detected_frontend and detected_frontend[lib_name] is not None: continue
 
         for pattern_info in patterns:
             ptype = pattern_info['type']
@@ -376,14 +380,13 @@ def detect_frontend(html_content, url):
                                 match_found = True
                                 if 'version_group' in pattern_info and len(match.groups()) >= pattern_info['version_group'] and match.group(pattern_info['version_group']):
                                     version = match.group(pattern_info['version_group'])
-                                break # Found script source match
+                                break
                 elif ptype == 'html':
                      match = re.search(pattern_info['pattern'], html_content, re.IGNORECASE | re.DOTALL)
                      if match:
                         match_found = True
                         if 'version_group' in pattern_info and len(match.groups()) >= pattern_info['version_group'] and match.group(pattern_info['version_group']):
                             version = match.group(pattern_info['version_group'])
-                        # Don't break, check all html patterns
                 elif ptype == 'script_content':
                     if inline_scripts:
                         match = re.search(pattern_info['pattern'], inline_scripts, re.IGNORECASE | re.DOTALL)
@@ -391,7 +394,6 @@ def detect_frontend(html_content, url):
                             match_found = True
                             if 'version_group' in pattern_info and len(match.groups()) >= pattern_info['version_group'] and match.group(pattern_info['version_group']):
                                 version = match.group(pattern_info['version_group'])
-                            # Don't break, check all script_content patterns
                 elif ptype == 'css':
                      for href in css_links:
                          if isinstance(href, str):
@@ -400,19 +402,19 @@ def detect_frontend(html_content, url):
                                 match_found = True
                                 if 'version_group' in pattern_info and len(match.groups()) >= pattern_info['version_group'] and match.group(pattern_info['version_group']):
                                     version = match.group(pattern_info['version_group'])
-                                break # Found CSS link match
+                                break
 
                 if match_found:
                     if lib_name not in detected_frontend or (version and detected_frontend[lib_name] is None):
                          detected_frontend[lib_name] = version
-                    if version: # If we found a version, break inner loop (patterns)
+                    if version:
                         break
 
             except Exception as e:
-                pass
+                if verbose: print(f"[!] [{target_display}] Error during Frontend detection pattern ({lib_name} - {ptype}): {e}")
                 continue
 
-            if lib_name in detected_frontend and detected_frontend[lib_name]: break # Break outer loop if version found
+            if lib_name in detected_frontend and detected_frontend[lib_name]: break
 
     formatted_frontend = []
     for name, ver in detected_frontend.items():
@@ -440,71 +442,56 @@ def run_wafw00f(target_url, verbose):
         cleaned_stderr = ansi_escape_pattern.sub('', process.stderr)
 
         if process.returncode != 0:
+            # Show "command not found" error regardless of verbose flag if -w was used
             if "command not found" in cleaned_stderr.lower() or "no such file" in cleaned_stderr.lower():
                  print(f"[!] [{target_display}] Error: 'wafw00f' command not found. Please ensure it's installed and in your PATH.")
-                 return []
-            elif "timed out" in cleaned_stderr.lower():
-                 print(f"[!] [{target_display}] Error: wafw00f scan timed out.")
-                 return []
-            else:
-                 # Only print generic error if verbose to reduce noise
-                 if verbose: print(f"[!] [{target_display}] Error running wafw00f (return code {process.returncode}): {cleaned_stderr.strip()}")
-                 return []
+                 return ["Error: wafw00f not found"] # Return specific error message
+            # Show other errors only if verbose
+            elif verbose:
+                if "timed out" in cleaned_stderr.lower():
+                     print(f"[!] [{target_display}] Error: wafw00f scan timed out.")
+                else:
+                     print(f"[!] [{target_display}] Error running wafw00f (return code {process.returncode}): {cleaned_stderr.strip()}")
+            return [] # Return empty list for other errors unless verbose
 
         # Parse cleaned stdout for WAF information
         output_lines = cleaned_stdout.splitlines()
-
-        # --- Refined WAF Parsing Logic ---
-        # Pattern for specific WAF detection (captures name more carefully)
-        # Looks for 'is behind', then captures word/space/hyphen chars, optionally ignores vendor in (), ends with 'WAF'
         specific_waf_pattern = re.compile(r'is behind\s+(?:the\s+)?([\w\s-]+?)(?:\s+\(.*\))?\s+WAF', re.IGNORECASE)
-        # Pattern for generic WAF/security solution detection
         generic_waf_pattern = re.compile(r'behind a WAF or some sort of security solution', re.IGNORECASE)
-        # Alternative pattern sometimes seen: [+] Found WAF: Name (Vendor)
         found_waf_pattern = re.compile(r'\[\+\]\s+Found WAF:\s*([\w\s-]+?)(?:\s+\(.*\))?$', re.IGNORECASE)
 
         potential_waf_names = []
         for line in output_lines:
-            # Check "Found WAF:" pattern
             found_match = found_waf_pattern.search(line)
             if found_match:
                 waf_name = found_match.group(1).strip()
                 potential_waf_names.append(waf_name)
-                continue # Prioritize this pattern for the line
+                continue
 
-            # Check "is behind" pattern
             specific_match = specific_waf_pattern.search(line)
             if specific_match:
                 waf_name = specific_match.group(1).strip()
-                # Exclude generic messages if caught here
                 if "generic detection" not in waf_name.lower():
                      potential_waf_names.append(waf_name)
 
-            # Check for generic message separately
-            if generic_waf_pattern.search(line):
+            elif generic_waf_pattern.search(line):
                  generic_waf_detected = True
 
         # Process potential names: handle "and/or", unique the list
         final_waf_list = set()
         for name in potential_waf_names:
-            # Simple split on common separators used by wafw00f for multiple detections
-            # Added ',' as a potential separator based on user feedback example
             parts = re.split(r'\s+and(?:/or)?\s+|,', name, flags=re.IGNORECASE)
             for part in parts:
                 cleaned_part = part.strip()
-                # Additional check to remove trailing junk like ', a' if split didn't catch it
-                cleaned_part = re.sub(r',\s*a$', '', cleaned_part).strip()
-                if cleaned_part: # Avoid adding empty strings
+                cleaned_part = re.sub(r',\s*a$', '', cleaned_part).strip() # Remove trailing ', a'
+                if cleaned_part:
                     final_waf_list.add(cleaned_part)
 
-        # Convert set back to list
         detected_waf = list(final_waf_list)
 
-        # If no specific WAF was found, but the generic message was seen, report it
         if not detected_waf and generic_waf_detected:
-            detected_waf.append("Generic WAF/Security Solution") # Use a standard name
+            detected_waf.append("Generic WAF/Security Solution")
 
-        # Logging based on final list
         if not detected_waf and verbose:
              print(f"[*] [{target_display}] wafw00f: No WAF detected.")
         elif detected_waf and verbose:
@@ -512,21 +499,21 @@ def run_wafw00f(target_url, verbose):
 
 
     except FileNotFoundError:
+        # Show "command not found" error regardless of verbose flag if -w was used
         print(f"[!] [{target_display}] Error: 'wafw00f' command not found. Please ensure it's installed and in your PATH.")
-        return []
+        return ["Error: wafw00f not found"] # Return specific error message
     except subprocess.TimeoutExpired:
-        print(f"[!] [{target_display}] Error: wafw00f scan timed out.")
+        if verbose: print(f"[!] [{target_display}] Error: wafw00f scan timed out.")
         return []
     except Exception as e:
-        print(f"[!] [{target_display}] An unexpected error occurred while running wafw00f: {e}")
+        if verbose: print(f"[!] [{target_display}] An unexpected error occurred while running wafw00f: {e}")
         return []
 
-    # Return unique WAF names found
-    return detected_waf # Already unique from set conversion
+    return detected_waf
 
 
 # --- Output Functions ---
-
+# (display_terminal and save_excel remain unchanged)
 def display_terminal(results):
     """Displays results for a single target in a consolidated format."""
     target_url = results.get('Target URL', 'N/A')
@@ -776,56 +763,69 @@ def save_excel(all_results, filename):
 
 
 # --- Threading Worker ---
-# (scan_target_worker remains unchanged from previous version)
 def scan_target_worker(q, results_list, results_lock, check_waf, verbose): # Added check_waf flag
     """Worker thread function to process URLs from the queue."""
-    while not q.empty():
-        try:
-            target_url = q.get_nowait() # Non-blocking get
-        except queue.Empty:
-            continue # Queue might be empty if multiple threads race
+    # Added try-except block for overall worker resilience
+    target_url = None # Initialize in case queue.get fails immediately
+    try:
+        while not q.empty():
+            try:
+                target_url = q.get_nowait() # Non-blocking get
+            except queue.Empty:
+                continue # Queue might be empty if multiple threads race
 
-        target_display = target_url[:50] + "..." if len(target_url) > 50 else target_url
-        if verbose: print(f"[*] Thread {threading.current_thread().name} scanning: {target_display}")
+            target_display = target_url[:50] + "..." if len(target_url) > 50 else target_url
+            if verbose: print(f"[*] Thread {threading.current_thread().name} scanning: {target_display}")
 
-        headers, html_content, final_url, cookies, status_code = make_request(target_url)
+            headers, html_content, final_url, cookies, status_code = make_request(target_url, verbose) # Pass verbose
 
-        current_result = {
-            'Target URL': target_url,
-            'Final URL': final_url if final_url else target_url,
-            'Status Code': status_code,
-            'CMS': [], 'Backend': [], 'Frontend': [], 'WAF': [],
-            'WAF_Checked': check_waf # Track if WAF check was requested
-        }
+            current_result = {
+                'Target URL': target_url,
+                'Final URL': final_url if final_url else target_url,
+                'Status Code': status_code,
+                'CMS': [], 'Backend': [], 'Frontend': [], 'WAF': [],
+                'WAF_Checked': check_waf # Track if WAF check was requested
+            }
 
-        is_error_status = status_code is None or not isinstance(status_code, int) or status_code >= 400
-        no_content = not headers and not html_content
+            is_error_status = status_code is None or not isinstance(status_code, int) or status_code >= 400
+            no_content = not headers and not html_content
 
-        # Run WAF check if requested
-        if check_waf:
-            # Pass original URL (before potential redirects) to wafw00f
-            current_result['WAF'] = run_wafw00f(target_url, verbose)
+            # Run WAF check if requested
+            if check_waf:
+                # Pass original URL (before potential redirects) to wafw00f
+                current_result['WAF'] = run_wafw00f(target_url, verbose)
 
-        # Perform other detections
-        if is_error_status:
-            if not no_content:
-                 current_result['CMS'] = detect_cms(headers, html_content, target_url, cookies) # Use target_url for consistency
-                 current_result['Backend'] = detect_backend(headers, cookies, target_url)
-                 current_result['Frontend'] = detect_frontend(html_content, target_url)
-        else:
-             current_result['CMS'] = detect_cms(headers, html_content, target_url, cookies) # Use target_url for consistency
-             current_result['Backend'] = detect_backend(headers, cookies, target_url)
-             current_result['Frontend'] = detect_frontend(html_content, target_url)
+            # Perform other detections
+            if is_error_status:
+                if not no_content:
+                     # Pass verbose flag to detection functions
+                     current_result['CMS'] = detect_cms(headers, html_content, target_url, cookies, verbose)
+                     current_result['Backend'] = detect_backend(headers, cookies, target_url, verbose)
+                     current_result['Frontend'] = detect_frontend(html_content, target_url, verbose)
+            else:
+                 # Pass verbose flag to detection functions
+                 current_result['CMS'] = detect_cms(headers, html_content, target_url, cookies, verbose)
+                 current_result['Backend'] = detect_backend(headers, cookies, target_url, verbose)
+                 current_result['Frontend'] = detect_frontend(html_content, target_url, verbose)
 
-        # Safely append result to the shared list
-        with results_lock:
-            results_list.append(current_result)
+            # Safely append result to the shared list
+            with results_lock:
+                results_list.append(current_result)
 
-        q.task_done() # Signal that this task is complete
+            q.task_done() # Signal that this task is complete
+    except Exception as e:
+         # Catch unexpected errors within the thread loop for a specific target
+         target_display = target_url[:50] + "..." if target_url and len(target_url) > 50 else target_url
+         print(f"[!] Thread {threading.current_thread().name} encountered an error processing '{target_display}': {e}")
+         # Ensure task_done is called even if an error occurred after getting from queue
+         if target_url: # Check if we successfully got an item before the error
+              try:
+                   q.task_done()
+              except ValueError: # task_done might raise ValueError if called too many times
+                   pass
 
 
 # --- Main Execution ---
-# (main function remains unchanged from previous version)
 def main():
     # Updated description to mention wafw00f dependency
     parser = argparse.ArgumentParser(
@@ -839,7 +839,7 @@ def main():
     parser.add_argument("-t", "--threads", type=int, default=4, help="Number of concurrent threads for list scanning (default: 4).")
     # Added -w flag for WAF detection
     parser.add_argument("-w", "--waf", action="store_true", help="Enable WAF detection using the external 'wafw00f' tool (requires wafw00f installed).")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Increase output verbosity (show thread activity, etc.).")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Increase output verbosity (show errors, thread activity, etc.).") # Updated help
 
     args = parser.parse_args()
 
@@ -862,6 +862,9 @@ def main():
     except ImportError: missing_libs.append("beautifulsoup4")
     try: import openpyxl
     except ImportError: missing_libs.append("openpyxl")
+    try: import lxml # Added lxml check
+    except ImportError: missing_libs.append("lxml")
+
 
     if missing_libs:
         print(f"[!] Missing required libraries: {', '.join(missing_libs)}")
@@ -901,7 +904,7 @@ def main():
 
         threads = []
         for i in range(args.threads):
-            # Pass args.waf to the worker
+            # Pass args.waf and args.verbose to the worker
             thread = threading.Thread(target=scan_target_worker, args=(target_queue, all_scan_results, results_lock, args.waf, args.verbose), name=f"Worker-{i+1}")
             thread.daemon = True
             threads.append(thread)
@@ -917,7 +920,7 @@ def main():
         for target_url in targets:
             target_display = target_url[:50] + "..." if len(target_url) > 50 else target_url
 
-            headers, html_content, final_url, cookies, status_code = make_request(target_url)
+            headers, html_content, final_url, cookies, status_code = make_request(target_url, args.verbose) # Pass verbose
 
             current_result = {
                 'Target URL': target_url,
@@ -938,13 +941,15 @@ def main():
             # Perform other detections
             if is_error_status:
                 if not no_content:
-                     current_result['CMS'] = detect_cms(headers, html_content, target_url, cookies) # Use target_url for consistency
-                     current_result['Backend'] = detect_backend(headers, cookies, target_url)
-                     current_result['Frontend'] = detect_frontend(html_content, target_url)
+                     # Pass verbose flag
+                     current_result['CMS'] = detect_cms(headers, html_content, target_url, cookies, args.verbose)
+                     current_result['Backend'] = detect_backend(headers, cookies, target_url, args.verbose)
+                     current_result['Frontend'] = detect_frontend(html_content, target_url, args.verbose)
             else:
-                 current_result['CMS'] = detect_cms(headers, html_content, target_url, cookies) # Use target_url for consistency
-                 current_result['Backend'] = detect_backend(headers, cookies, target_url)
-                 current_result['Frontend'] = detect_frontend(html_content, target_url)
+                 # Pass verbose flag
+                 current_result['CMS'] = detect_cms(headers, html_content, target_url, cookies, args.verbose)
+                 current_result['Backend'] = detect_backend(headers, cookies, target_url, args.verbose)
+                 current_result['Frontend'] = detect_frontend(html_content, target_url, args.verbose)
 
             all_scan_results.append(current_result)
 
