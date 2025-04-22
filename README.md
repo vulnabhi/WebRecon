@@ -73,3 +73,8 @@ WAF         : Cloudflare
   Tags           : cloud
   Vulnerabilities: CVE-2021-44228
 ------------------------------------
+```
+**🙌 Credits**
+
+Developed by [@offsecabhi](https://github.com/offsecabhi)
+Feel free to contribute, suggest features, or report bugs via Issues or PRs.
