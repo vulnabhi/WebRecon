@@ -43,3 +43,10 @@ BackRecon scans one or more target URLs to fingerprint the underlying web techno
 
 ```bash
 python WebRecon.py [-h] (-d DOMAIN | -l LIST) [-o OUTPUT] [-t THREADS] [-w] [-v]
+```
+
+**🙌 Credits**
+
+Developed by [@offsecabhi](https://github.com/offsecabhi)
+Feel free to contribute, suggest features, or report bugs via Issues or PRs.
+
