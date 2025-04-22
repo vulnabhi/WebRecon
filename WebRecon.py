@@ -14,19 +14,36 @@ from openpyxl.utils import get_column_letter # For column width adjustment
 import threading
 import queue
 from collections import Counter
-# Import for running external commands
+# Import for running external commands and DNS resolution
 import subprocess
-import shlex # For safe command construction (though not strictly needed here)
+import shlex
+import socket # For DNS resolution
+# Import for config file handling
+import json
 
 # --- Configuration ---
+
+# Define the string to use when a technology category is not detected
+NOT_DETECTED_STRING = "Not Found" # <--- CHANGE THIS STRING IF YOU WANT SOMETHING ELSE
+
+# Flag to track if Shodan API error has been printed (to avoid repetition)
+shodan_api_error_printed = False
+
 # PATTERNS dictionaries remain unchanged (CMS, Backend, Frontend)
 CMS_PATTERNS = {
     # Format: CMS Name: (Detected String with {version} placeholder, Version if found, Source Info)
     'WordPress': [
+        # Meta tag is often the best source for version
         {'type': 'meta', 'name': 'generator', 'content': r'WordPress\s*([\d\.]+)?', 'version_group': 1},
-        {'type': 'path', 'pattern': '/wp-content/'},
-        {'type': 'path', 'pattern': '/wp-includes/'},
+        # Strong path/script indicators (check these early)
+        {'type': 'path', 'pattern': '/wp-content/'}, # Check for core path
+        {'type': 'path', 'pattern': '/wp-includes/'}, # Check for core path
+        {'type': 'script', 'pattern': r'/wp-emoji-release\.min\.js'}, # Common WP script (Raw string fix)
+        # Fallback version detection from query parameters
+        {'type': 'link_script_ver', 'pattern': r'\?ver=([\d\.]+)'}, # Check ?ver= in script/link tags
+        # Other indicators
         {'type': 'header', 'name': 'Link', 'pattern': 'rel="https://api.w.org/"'},
+        {'type': 'html', 'pattern': 'wp-block-library-css'}, # Common CSS ID/handle
     ],
     'Joomla': [
         {'type': 'meta', 'name': 'generator', 'content': r'Joomla!\s*([\d\.]+)?', 'version_group': 1},
@@ -138,7 +155,7 @@ FRONTEND_PATTERNS = {
 def make_request(url, verbose=False): # Added verbose flag
     """Makes an HTTP GET request to the URL."""
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 BackReconTool/1.7' # Version bump
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 BackReconTool/1.9' # Version bump
     }
     try:
         requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
@@ -160,13 +177,11 @@ def make_request(url, verbose=False): # Added verbose flag
                 response = session.get(target_url_https, timeout=15, verify=True, allow_redirects=True)
                 response.raise_for_status()
             except requests.exceptions.SSLError as ssl_err:
-                 # Show error only if verbose
                  if verbose: print(f"[*] [{target_display}] HTTPS SSL error: {ssl_err}. Trying HTTP...")
                  target_url_http = f'http://{parsed_url.netloc}{parsed_url.path or "/"}' + (f"?{parsed_url.query}" if parsed_url.query else "")
                  response = session.get(target_url_http, timeout=15, verify=False, allow_redirects=True)
                  response.raise_for_status()
             except requests.exceptions.RequestException as req_err:
-                # Show error only if verbose
                 if verbose: print(f"[*] [{target_display}] HTTPS failed: {req_err}. Trying HTTP...")
                 target_url_http = f'http://{parsed_url.netloc}{parsed_url.path or "/"}' + (f"?{parsed_url.query}" if parsed_url.query else "")
                 response = session.get(target_url_http, timeout=15, verify=False, allow_redirects=True)
@@ -176,12 +191,10 @@ def make_request(url, verbose=False): # Added verbose flag
                  response = session.get(url, timeout=15, verify=True, allow_redirects=True)
                  response.raise_for_status()
              except requests.exceptions.SSLError as ssl_err:
-                 # Show error only if verbose
                  if verbose: print(f"[*] [{target_display}] SSL verification failed: {ssl_err}. Retrying without verification...")
                  response = session.get(url, timeout=15, verify=False, allow_redirects=True)
                  response.raise_for_status()
              except requests.exceptions.RequestException as req_err:
-                 # Show error only if verbose
                  if verbose: print(f"[!] [{target_display}] Error fetching: {req_err}")
                  status = None
                  if hasattr(req_err, 'response') and req_err.response is not None: status = req_err.response.status_code
@@ -192,7 +205,6 @@ def make_request(url, verbose=False): # Added verbose flag
             response.encoding = response.apparent_encoding
             content = response.text
         except Exception as enc_err:
-             # Show error only if verbose
              if verbose: print(f"[!] [{target_display}] Warning: Encoding error: {enc_err}. Using response.text directly.")
              try: content = response.text
              except Exception as text_err:
@@ -233,13 +245,28 @@ def detect_cms(headers, html_content, url, cookies, verbose=False): # Added verb
         if verbose: print(f"[!] [{target_display}] Error parsing HTML for CMS detection: {e}")
         return detected_cms
 
+    # Pre-extract potential version from query parameters (?ver=...)
+    query_param_version = None
+    ver_pattern = re.compile(r'\?ver=([\d\.]+)')
+    scripts_and_links = soup.select('script[src], link[rel="stylesheet"][href]')
+    for tag in scripts_and_links:
+        src_or_href = tag.get('src') or tag.get('href')
+        if src_or_href:
+            match = ver_pattern.search(src_or_href)
+            if match:
+                query_param_version = match.group(1)
+                if verbose: print(f"[*] [{target_display}] Found potential version '{query_param_version}' from query parameter in {src_or_href}")
+                break # Found one, stop looking
+
     for cms_name, patterns in CMS_PATTERNS.items():
-        if cms_name in detected_cms and detected_cms[cms_name] is not None: continue # Skip if already found with version
+        cms_identified = False
+        version_found = None
 
         for pattern_info in patterns:
             ptype = pattern_info['type']
-            version = None
-            match_found = False
+            match_found_in_pattern = False
+            current_pattern_version = None
+
             try:
                 if ptype == 'meta':
                     meta_tags = soup.select(f'meta[name="{pattern_info["name"]}"]')
@@ -248,23 +275,27 @@ def detect_cms(headers, html_content, url, cookies, verbose=False): # Added verb
                         if content:
                             match = re.search(pattern_info['content'], content, re.IGNORECASE)
                             if match:
-                                match_found = True
+                                match_found_in_pattern = True
                                 if 'version_group' in pattern_info and len(match.groups()) >= pattern_info['version_group'] and match.group(pattern_info['version_group']):
-                                    version = match.group(pattern_info['version_group'])
+                                    current_pattern_version = match.group(pattern_info['version_group'])
+                                    if verbose: print(f"[*] [{target_display}] CMS Version Match (Meta): {cms_name} {current_pattern_version}")
                                 break
                 elif ptype == 'path':
-                    elements = soup.select('a[href*="{0}"], link[href*="{0}"], script[src*="{0}"], img[src*="{0}"]'.format(pattern_info['pattern']))
+                    path_pattern = pattern_info['pattern']
+                    elements = soup.select(f'a[href*="{path_pattern}"], link[href*="{path_pattern}"], script[src*="{path_pattern}"], img[src*="{path_pattern}"]')
                     if elements:
-                        match_found = True; break
+                        match_found_in_pattern = True
+                        if verbose: print(f"[*] [{target_display}] CMS Pattern Match (Path): {cms_name} via '{path_pattern}'")
                 elif ptype == 'header':
                     if headers is not None:
                         header_value = headers.get(pattern_info['name'])
                         if header_value:
                              match = re.search(pattern_info['pattern'], header_value, re.IGNORECASE)
                              if match:
-                                match_found = True
+                                match_found_in_pattern = True
                                 if 'version_group' in pattern_info and len(match.groups()) >= pattern_info['version_group'] and match.group(pattern_info['version_group']):
-                                    version = match.group(pattern_info['version_group'])
+                                    current_pattern_version = match.group(pattern_info['version_group'])
+                                    if verbose: print(f"[*] [{target_display}] CMS Version Match (Header): {cms_name} {current_pattern_version}")
                 elif ptype == 'cookie':
                      if cookies:
                         for cookie in cookies:
@@ -272,28 +303,47 @@ def detect_cms(headers, html_content, url, cookies, verbose=False): # Added verb
                             if isinstance(pattern_info['name'], re.Pattern):
                                 if pattern_info['name'].match(cookie.name): is_match = True
                             elif pattern_info['name'] == cookie.name: is_match = True
-                            if is_match: match_found = True; break
+                            if is_match: match_found_in_pattern = True; break
                 elif ptype == 'script':
-                     pattern_re = pattern_info['pattern'] if isinstance(pattern_info['pattern'], re.Pattern) else re.compile(pattern_info['pattern'], re.IGNORECASE)
-                     scripts = soup.select(f'script[src*="{pattern_info["pattern"]}"]')
-                     if scripts: match_found = True
+                     scripts = soup.find_all('script', src=True)
+                     script_pattern_re = re.compile(pattern_info['pattern'], re.IGNORECASE)
+                     for script in scripts:
+                         if script_pattern_re.search(script['src']):
+                             match_found_in_pattern = True
+                             if verbose: print(f"[*] [{target_display}] CMS Pattern Match (Script): {cms_name} via '{pattern_info['pattern']}' in {script['src']}")
+                             break
                 elif ptype == 'html':
                      if isinstance(html_content, str) and re.search(pattern_info['pattern'], html_content, re.IGNORECASE | re.DOTALL):
-                         match_found = True
+                         match_found_in_pattern = True
+                elif ptype == 'link_script_ver':
+                     if query_param_version:
+                         # Apply this version only if CMS is already identified but lacks version
+                         if cms_identified and version_found is None:
+                             current_pattern_version = query_param_version
+                             match_found_in_pattern = True # Mark as match to update version
+                             if verbose: print(f"[*] [{target_display}] CMS Version Match (Query Param): {cms_name} {current_pattern_version}")
 
-                if match_found:
-                    if cms_name not in detected_cms or (version and detected_cms[cms_name] is None):
-                         detected_cms[cms_name] = version
-                    if version:
-                        break
+                # --- Update results based on current pattern match ---
+                if match_found_in_pattern:
+                    cms_identified = True # Mark that we found evidence for this CMS
+                    # Prioritize version found by this specific pattern (meta/header first)
+                    if current_pattern_version:
+                        version_found = current_pattern_version
+                        # If version found via meta/header, we can often stop checking other patterns
+                        if ptype in ['meta', 'header']:
+                             break # Break inner loop
 
             except Exception as e:
-                # Print specific pattern error only if verbose
                 if verbose: print(f"[!] [{target_display}] Error during CMS detection pattern ({cms_name} - {ptype}): {e}")
                 continue # Try next pattern
 
-            if cms_name in detected_cms and detected_cms[cms_name]: break
+        # --- Finalize detection for this CMS ---
+        if cms_identified:
+            # Use the best version found (prioritizing meta/header, then query params)
+            final_version = version_found if version_found else (query_param_version if cms_name == 'WordPress' else None) # Only apply query param version to WP for now
+            detected_cms[cms_name] = final_version # Store name and best-found version (can be None)
 
+    # --- Format output ---
     formatted_cms = []
     for name, ver in detected_cms.items():
         formatted_cms.append(f"{name} ({ver})" if ver else name)
@@ -331,8 +381,7 @@ def detect_backend(headers, cookies, url, verbose=False): # Added verbose
                 if match_found:
                     if tech_name not in detected_backend or (version and detected_backend[tech_name] is None):
                          detected_backend[tech_name] = version
-                    if version:
-                        break
+                    if version: break
 
             except Exception as e:
                 if verbose: print(f"[!] [{target_display}] Error during Backend detection pattern ({tech_name} - {ptype}): {e}")
@@ -407,8 +456,7 @@ def detect_frontend(html_content, url, verbose=False): # Added verbose
                 if match_found:
                     if lib_name not in detected_frontend or (version and detected_frontend[lib_name] is None):
                          detected_frontend[lib_name] = version
-                    if version:
-                        break
+                    if version: break
 
             except Exception as e:
                 if verbose: print(f"[!] [{target_display}] Error during Frontend detection pattern ({lib_name} - {ptype}): {e}")
@@ -423,6 +471,7 @@ def detect_frontend(html_content, url, verbose=False): # Added verbose
 
 
 # --- WAF Detection using wafw00f ---
+# (run_wafw00f remains unchanged)
 def run_wafw00f(target_url, verbose):
     """Runs the wafw00f tool against the target URL and parses the output."""
     target_display = target_url[:50] + "..." if len(target_url) > 50 else target_url
@@ -511,9 +560,84 @@ def run_wafw00f(target_url, verbose):
 
     return detected_waf
 
+# --- Shodan Integration ---
+def query_shodan(ip_address, api_key, verbose):
+    """Queries Shodan API for host information."""
+    global shodan_api_error_printed # Use global flag
+    if not ip_address:
+        return None # Cannot query without IP
+
+    try:
+        import shodan
+    except ImportError:
+        # Print only once if library missing
+        if not shodan_api_error_printed:
+            print("[!] Error: 'shodan' library not found. Please install it (`pip install shodan`) to use Shodan integration.")
+            shodan_api_error_printed = True
+        return None
+
+    if verbose: print(f"[*] Querying Shodan for IP: {ip_address}")
+
+    try:
+        api = shodan.Shodan(api_key)
+        host_info = api.host(ip_address)
+        # Extract relevant data
+        shodan_data = {
+            "IP Address": ip_address, # Add IP address to results
+            "Organization": host_info.get('org', 'N/A'),
+            "ISP": host_info.get('isp', 'N/A'),
+            "Hostnames": ", ".join(host_info.get('hostnames', [])),
+            "Open Ports": ", ".join(map(str, host_info.get('ports', []))),
+            "Tags": ", ".join(host_info.get('tags', [])), # Often contains technologies
+            "Vulnerabilities": ", ".join(host_info.get('vulns', [])) # CVEs if found
+        }
+        if verbose: print(f"[*] Shodan data found for {ip_address}")
+        return shodan_data
+    except shodan.APIError as e:
+        # Print specific API errors (like invalid key) only once
+        error_msg = str(e).lower()
+        if 'invalid api key' in error_msg or 'access restricted' in error_msg:
+            if not shodan_api_error_printed:
+                print(f"[!] Shodan API Error: {e}. Check your key in config.json.")
+                print("[!] Note: Shodan free tier API keys have very limited access.")
+                print("[!] Shodan queries will be skipped for the rest of this run.")
+                shodan_api_error_printed = True
+        elif verbose: # Print other API errors only if verbose
+            print(f"[!] Shodan API error for {ip_address}: {e}")
+        return None # Return None on API error
+    except Exception as e:
+        # Handle other potential errors (network, etc.)
+        if verbose: print(f"[!] Error querying Shodan for {ip_address}: {e}")
+        return None # Return None on other errors
+
+
+# --- Config File Handling ---
+def load_shodan_key(config_file="config.json"):
+    """Loads Shodan API key from config file."""
+    try:
+        with open(config_file, 'r') as f:
+            config_data = json.load(f)
+            key = config_data.get("shodan_api_key")
+            if key:
+                print("[*] Loaded Shodan API key from config.json")
+                return key
+            else:
+                # Inform user if file exists but key is missing
+                print(f"[*] '{config_file}' found, but 'shodan_api_key' is missing or empty. Shodan queries disabled.")
+                return None
+    except FileNotFoundError:
+        # It's okay if the file doesn't exist
+        return None
+    except json.JSONDecodeError:
+        print(f"[!] Error: Could not decode JSON from {config_file}. Shodan queries disabled.")
+        return None
+    except Exception as e:
+        print(f"[!] Error reading {config_file}: {e}. Shodan queries disabled.")
+        return None
+
 
 # --- Output Functions ---
-# (display_terminal and save_excel remain unchanged)
+
 def display_terminal(results):
     """Displays results for a single target in a consolidated format."""
     target_url = results.get('Target URL', 'N/A')
@@ -523,26 +647,34 @@ def display_terminal(results):
     cms_results = results.get('CMS', [])
     backend_results = results.get('Backend', [])
     frontend_results = results.get('Frontend', [])
-    waf_results = results.get('WAF', []) # Get WAF results
+    waf_results = results.get('WAF', [])
+    shodan_results = results.get('Shodan', None) # Get Shodan results
 
     print(f"\n--- Results for: {target_url} ---")
-    print(f"{'Final URL':<12}: {final_url} (Status: {status_code})") # Left-align key
+    print(f"{'Final URL':<12}: {final_url} (Status: {status_code})")
 
-    cms_str = ', '.join(cms_results) if cms_results else "None detected"
-    backend_str = ', '.join(backend_results) if backend_results else "None detected"
-    frontend_str = ', '.join(frontend_results) if frontend_results else "None detected"
-    # Updated WAF string logic
-    if results.get('WAF_Checked') == False:
-        waf_str = "Not Checked"
-    elif waf_results:
-        waf_str = ', '.join(waf_results)
-    else: # WAF was checked, but list is empty
-        waf_str = "No Waf" # Changed from "None detected"
+    cms_str = ', '.join(cms_results) if cms_results else NOT_DETECTED_STRING # Use constant
+    backend_str = ', '.join(backend_results) if backend_results else NOT_DETECTED_STRING # Use constant
+    frontend_str = ', '.join(frontend_results) if frontend_results else NOT_DETECTED_STRING # Use constant
+    if results.get('WAF_Checked') == False: waf_str = "Not Checked"
+    elif waf_results: waf_str = ', '.join(waf_results)
+    else: waf_str = "No Waf"
 
     print(f"{'CMS':<12}: {cms_str}")
     print(f"{'Backend':<12}: {backend_str}")
     print(f"{'Frontend':<12}: {frontend_str}")
-    print(f"{'WAF':<12}: {waf_str}") # Print WAF results
+    print(f"{'WAF':<12}: {waf_str}")
+
+    # Display Shodan Info only if it's a dictionary (successful query)
+    if isinstance(shodan_results, dict): # Check it's dict (implicitly excludes None and error strings)
+        print("\n[+] Shodan Info:")
+        for key, value in shodan_results.items():
+            display_value = value
+            if isinstance(value, str) and len(value) > 80: display_value = value[:77] + "..."
+            if display_value: print(f"  {key:<15}: {display_value}")
+    elif results.get('Shodan_Checked'): # If checked but failed/no data
+        print(f"{'Shodan':<12}: Query attempted, no data or error.")
+
 
     print("-" * (len(target_url) + 18)) # Separator
 
@@ -638,7 +770,6 @@ def save_excel(all_results, filename):
 
         for idx, result in enumerate(all_results):
             target = result.get('Target URL', 'N/A')
-            tech_found_for_target = False
             row_start_for_this_target = current_row
 
             # Determine WAF string for this target *once*
@@ -646,60 +777,79 @@ def save_excel(all_results, filename):
             if result.get('WAF_Checked') == False:
                 waf_display_str = "Not Checked"
             elif waf_list:
-                # WAF names should be clean from run_wafw00f now
                 waf_display_str = ', '.join(waf_list)
-            else: # WAF was checked, but list is empty
-                waf_display_str = "No Waf" # Changed from "None detected (wafw00f)"
+            else:
+                waf_display_str = "No Waf"
 
             # Apply Top Border if New Domain
             if idx > 0:
                 prev_target = all_results[idx-1].get('Target URL', 'N/A')
                 if target != prev_target:
-                    # Apply border to columns A, B, C, D (index 1 to 4)
-                    for col_idx in range(1, 5):
+                    for col_idx in range(1, 5): # Columns A, B, C, D
                          cell = ws_tech.cell(row=row_start_for_this_target, column=col_idx)
                          existing_border = cell.border if cell.border else Border()
                          cell.border = Border(top=domain_separator_border.top, left=existing_border.left, right=existing_border.right, bottom=existing_border.bottom)
 
-            # Define categories (excluding WAF as it's now a separate column)
-            categories_data = [
-                ("CMS", result.get('CMS', [])),
-                ("Backend", result.get('Backend', [])),
-                ("Frontend", result.get('Frontend', []))
-            ]
+            # --- Write Data and Track Merges ---
+            rows_added_for_target = 0 # Track rows added for this target for merging
 
-            # Write Data and Track Category Merges
-            tech_added_count = 0 # Count actual tech rows added for this target
-            for category, items in categories_data:
-                if items:
+            # Define categories including Shodan (only if Shodan data exists and is not an error)
+            shodan_data = result.get('Shodan')
+            # Check if shodan_data is a dictionary and does not contain an 'Error' key
+            shodan_items_to_write = []
+            add_shodan_category = False
+            if isinstance(shodan_data, dict) and "Error" not in shodan_data: # Check it's a dict AND no error key
+                shodan_items_to_write = [f"{k}: {v}" for k, v in shodan_data.items() if v and v != 'N/A']
+                if shodan_items_to_write: # Only add category if there's actual data
+                    add_shodan_category = True
+
+            categories_data = {
+                "CMS": result.get('CMS', []),
+                "Backend": result.get('Backend', []),
+                "Frontend": result.get('Frontend', []),
+                "Shodan": shodan_items_to_write # Use the processed list
+            }
+
+            # Determine which categories to include in the loop
+            categories_to_process = ["CMS", "Backend", "Frontend"]
+            if add_shodan_category: # Only add Shodan if data is valid
+                categories_to_process.append("Shodan")
+
+            # Add rows for each category
+            for category in categories_to_process:
+                items = categories_data.get(category, [])
+                if items: # If list is not empty
                     category_merge_start_row = current_row
                     for item in items:
-                        # Write Target(A), WAF(B), Category(C), Tech(D)
                         ws_tech.cell(row=current_row, column=1, value=target)
-                        ws_tech.cell(row=current_row, column=2, value=waf_display_str) # WAF column
-                        ws_tech.cell(row=current_row, column=3, value=category)        # Category column
-                        ws_tech.cell(row=current_row, column=4, value=item)            # Tech column
+                        ws_tech.cell(row=current_row, column=2, value=waf_display_str)
+                        ws_tech.cell(row=current_row, column=3, value=category)
+                        ws_tech.cell(row=current_row, column=4, value=item)
                         current_row += 1
-                        tech_added_count += 1
-
-                    # Merge Category cells if needed (Column C now)
+                        rows_added_for_target += 1
+                    # Merge Category cells if needed
                     category_merge_end_row = current_row - 1
                     if category_merge_end_row > category_merge_start_row:
                         try:
-                            # Merge column C (index 3)
                             ws_tech.merge_cells(start_row=category_merge_start_row, start_column=3, end_row=category_merge_end_row, end_column=3)
                             merged_cell = ws_tech.cell(row=category_merge_start_row, column=3)
                             merged_cell.alignment = left_vertical_center_alignment
-                        except Exception as merge_err:
-                            print(f"[!] Warning: Could not merge Category cells for '{target}' > '{category}'. Error: {merge_err}")
+                        except Exception as merge_err: print(f"[!] Warning: Could not merge Category cells for '{target}' > '{category}'. Error: {merge_err}")
+                else: # If list is empty add "Not Found" row
+                    ws_tech.cell(row=current_row, column=1, value=target)
+                    ws_tech.cell(row=current_row, column=2, value=waf_display_str)
+                    ws_tech.cell(row=current_row, column=3, value=category)
+                    ws_tech.cell(row=current_row, column=4, value=NOT_DETECTED_STRING) # Use constant
+                    current_row += 1
+                    rows_added_for_target += 1
 
-            # If no CMS/Backend/Frontend found, add a placeholder row
-            # Still include the WAF info in its column for this row
-            if tech_added_count == 0:
+
+            # If no rows were added at all (e.g., error + no WAF check + no Shodan)
+            if rows_added_for_target == 0:
                  ws_tech.cell(row=current_row, column=1, value=target)
-                 ws_tech.cell(row=current_row, column=2, value=waf_display_str) # WAF column
-                 ws_tech.cell(row=current_row, column=3, value="N/A")             # Category column
-                 ws_tech.cell(row=current_row, column=4, value="No technologies detected") # Tech column
+                 ws_tech.cell(row=current_row, column=2, value=waf_display_str)
+                 ws_tech.cell(row=current_row, column=3, value="N/A")
+                 ws_tech.cell(row=current_row, column=4, value="No technologies detected")
                  current_row += 1
 
 
@@ -713,14 +863,12 @@ def save_excel(all_results, filename):
             if next_target_is_different or is_last_result:
                 url_merge_end_row = current_row - 1
                 if url_merge_end_row >= url_merge_start_row:
-                    # Only merge if more than one row was actually written for this target
-                    if url_merge_end_row > url_merge_start_row:
+                    # Check if more than one row was *actually added* for this target before merging
+                    if rows_added_for_target > 1: # Check if we added more than one row
                         try:
-                            # Merge Target URL column (A)
                             ws_tech.merge_cells(start_row=url_merge_start_row, start_column=1, end_row=url_merge_end_row, end_column=1)
                             merged_cell_url = ws_tech.cell(row=url_merge_start_row, column=1)
                             merged_cell_url.alignment = left_vertical_center_alignment
-                            # Merge WAF column (B)
                             ws_tech.merge_cells(start_row=url_merge_start_row, start_column=2, end_row=url_merge_end_row, end_column=2)
                             merged_cell_waf = ws_tech.cell(row=url_merge_start_row, column=2)
                             merged_cell_waf.alignment = left_vertical_center_alignment
@@ -746,9 +894,8 @@ def save_excel(all_results, filename):
                           if len(val_str) > max_length: max_length = len(val_str)
                  except: pass
              adjusted_width = (max_length + 2); min_width = 15
-             # Give WAF column (B) and Tech column (D) a bit more space potentially
              if column in ['B', 'D']: min_width = 25
-             elif column == 'C': min_width = 10 # Category column can be narrower
+             elif column == 'C': min_width = 10
              ws_tech.column_dimensions[column].width = max(adjusted_width, min_width)
 
 
@@ -757,22 +904,22 @@ def save_excel(all_results, filename):
 
     except NameError as e:
         if 'openpyxl' in str(e): print("[!] Error: `openpyxl` library not found or not imported correctly.\n[-] Please ensure it's installed: pip install openpyxl")
+        elif 'shodan' in str(e): print("[!] Error: `shodan` library not found or not imported correctly.\n[-] Please ensure it's installed: pip install shodan")
         else: print(f"[!] An unexpected NameError occurred: {e}")
     except Exception as e:
         print(f"[!] Error saving Excel file {filename}: {e}")
 
 
 # --- Threading Worker ---
-def scan_target_worker(q, results_list, results_lock, check_waf, verbose): # Added check_waf flag
+def scan_target_worker(q, results_list, results_lock, check_waf, shodan_key, verbose): # Added shodan_key
     """Worker thread function to process URLs from the queue."""
-    # Added try-except block for overall worker resilience
-    target_url = None # Initialize in case queue.get fails immediately
+    target_url = None
     try:
         while not q.empty():
             try:
-                target_url = q.get_nowait() # Non-blocking get
+                target_url = q.get_nowait()
             except queue.Empty:
-                continue # Queue might be empty if multiple threads race
+                continue
 
             target_display = target_url[:50] + "..." if len(target_url) > 50 else target_url
             if verbose: print(f"[*] Thread {threading.current_thread().name} scanning: {target_display}")
@@ -783,76 +930,93 @@ def scan_target_worker(q, results_list, results_lock, check_waf, verbose): # Add
                 'Target URL': target_url,
                 'Final URL': final_url if final_url else target_url,
                 'Status Code': status_code,
-                'CMS': [], 'Backend': [], 'Frontend': [], 'WAF': [],
-                'WAF_Checked': check_waf # Track if WAF check was requested
+                'CMS': [], 'Backend': [], 'Frontend': [], 'WAF': [], 'Shodan': None, # Initialize Shodan
+                'WAF_Checked': check_waf,
+                'Shodan_Checked': bool(shodan_key) # Track if Shodan check was requested and key was valid
             }
 
             is_error_status = status_code is None or not isinstance(status_code, int) or status_code >= 400
             no_content = not headers and not html_content
 
-            # Run WAF check if requested
+            # --- Run Optional Checks ---
             if check_waf:
-                # Pass original URL (before potential redirects) to wafw00f
                 current_result['WAF'] = run_wafw00f(target_url, verbose)
 
-            # Perform other detections
+            shodan_ip_address = None # Track IP used for Shodan
+            if shodan_key: # Only query if key is provided
+                try:
+                    hostname_to_resolve = urlparse(final_url if final_url else target_url).hostname
+                    if hostname_to_resolve:
+                        shodan_ip_address = socket.gethostbyname(hostname_to_resolve) # Store the IP
+                        current_result['Shodan'] = query_shodan(shodan_ip_address, shodan_key, verbose)
+                    elif verbose: print(f"[!] [{target_display}] Could not extract hostname for Shodan lookup.")
+                except socket.gaierror as e:
+                    if verbose: print(f"[!] [{target_display}] DNS resolution failed for Shodan lookup: {e}")
+                except Exception as e:
+                     if verbose: print(f"[!] [{target_display}] Error during DNS resolution for Shodan: {e}")
+                # Shodan result will be None if query fails
+
+
+            # --- Perform Core Detections ---
             if is_error_status:
                 if not no_content:
-                     # Pass verbose flag to detection functions
                      current_result['CMS'] = detect_cms(headers, html_content, target_url, cookies, verbose)
                      current_result['Backend'] = detect_backend(headers, cookies, target_url, verbose)
                      current_result['Frontend'] = detect_frontend(html_content, target_url, verbose)
             else:
-                 # Pass verbose flag to detection functions
                  current_result['CMS'] = detect_cms(headers, html_content, target_url, cookies, verbose)
                  current_result['Backend'] = detect_backend(headers, cookies, target_url, verbose)
                  current_result['Frontend'] = detect_frontend(html_content, target_url, verbose)
 
-            # Safely append result to the shared list
+            # Safely append result
             with results_lock:
                 results_list.append(current_result)
 
-            q.task_done() # Signal that this task is complete
+            q.task_done()
     except Exception as e:
-         # Catch unexpected errors within the thread loop for a specific target
          target_display = target_url[:50] + "..." if target_url and len(target_url) > 50 else target_url
          print(f"[!] Thread {threading.current_thread().name} encountered an error processing '{target_display}': {e}")
-         # Ensure task_done is called even if an error occurred after getting from queue
-         if target_url: # Check if we successfully got an item before the error
-              try:
-                   q.task_done()
-              except ValueError: # task_done might raise ValueError if called too many times
-                   pass
+         if target_url:
+              try: q.task_done()
+              except ValueError: pass
 
 
 # --- Main Execution ---
 def main():
-    # Updated description to mention wafw00f dependency
     parser = argparse.ArgumentParser(
-        description="BackRecon Tool: Detect web technologies (CMS, Backend, Frontend) and optionally WAF.",
-        epilog="Note: WAF detection (-w) requires the 'wafw00f' tool to be installed and in your system's PATH." # Added (-w)
+        description="BackRecon Tool: Detect web technologies (CMS, Backend, Frontend), optionally WAF and Shodan info.", # Updated desc
+        epilog="Notes:\n"
+               "  WAF detection (-w) requires the 'wafw00f' tool to be installed and in your system's PATH.\n"
+               "  Shodan integration (-s) requires a 'config.json' file with your API key and the 'shodan' Python library (`pip install shodan`).\n" # Updated Shodan note
+               "  Example config.json: {\"shodan_api_key\": \"YOUR_KEY_HERE\"}"
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-d", "--domain", help="Single target domain or URL (e.g., example.com)")
     group.add_argument("-l", "--list", help="File containing a list of target domains or URLs (one per line).")
     parser.add_argument("-o", "--output", help="Output filename for combined Excel report (e.g., report.xlsx).")
     parser.add_argument("-t", "--threads", type=int, default=4, help="Number of concurrent threads for list scanning (default: 4).")
-    # Added -w flag for WAF detection
-    parser.add_argument("-w", "--waf", action="store_true", help="Enable WAF detection using the external 'wafw00f' tool (requires wafw00f installed).")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Increase output verbosity (show errors, thread activity, etc.).") # Updated help
+    parser.add_argument("-w", "--waf", action="store_true", help="Enable WAF detection using 'wafw00f'.")
+    # Added -s flag for Shodan
+    parser.add_argument("-s", "--shodan", action="store_true", help="Enable Shodan host enrichment (requires config.json with API key and 'shodan' library).")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Increase output verbosity (show errors, thread activity, etc.).")
 
     args = parser.parse_args()
 
-    # Validate threads argument
     if args.threads < 1:
-        print("[!] Error: Number of threads must be at least 1.")
-        exit(1)
+        print("[!] Error: Number of threads must be at least 1."); exit(1)
 
-    # --- Auto-append .xlsx to output filename if needed ---
     output_filename = args.output
     if output_filename and not output_filename.lower().endswith('.xlsx'):
         output_filename += '.xlsx'
         print(f"[*] Output filename amended to: {output_filename}")
+
+    # --- Load Shodan Key ---
+    shodan_api_key = None
+    if args.shodan: # Only try loading if -s flag is present
+        shodan_api_key = load_shodan_key()
+        if not shodan_api_key:
+            print("[!] Shodan lookup enabled (-s) but no valid API key found in config.json. Shodan queries will be skipped.")
+            # Proceed without Shodan key if not found/invalid
 
     # --- Dependency Check ---
     missing_libs = []
@@ -862,8 +1026,12 @@ def main():
     except ImportError: missing_libs.append("beautifulsoup4")
     try: import openpyxl
     except ImportError: missing_libs.append("openpyxl")
-    try: import lxml # Added lxml check
+    try: import lxml
     except ImportError: missing_libs.append("lxml")
+    # Check for shodan only if -s flag is used and key was potentially loaded
+    if args.shodan:
+        try: import shodan
+        except ImportError: missing_libs.append("shodan")
 
 
     if missing_libs:
@@ -879,22 +1047,23 @@ def main():
         if not os.path.exists(args.list):
              print(f"[!] Error: Input file not found: {args.list}"); exit(1)
         try:
-            with open(args.list, 'r', encoding='utf-8') as f: # Specify encoding
+            with open(args.list, 'r', encoding='utf-8') as f:
                 targets = [line.strip() for line in f if line.strip() and not line.startswith('#')]
             if not targets:
                  print(f"[!] Error: Input file '{args.list}' is empty or contains no valid targets."); exit(1)
             print(f"[*] Loaded {len(targets)} target(s) from {args.list}")
         except IOError as e:
             print(f"[!] Error reading file {args.list}: {e}"); exit(1)
-        except Exception as e: # Catch potential encoding errors
+        except Exception as e:
              print(f"[!] Error processing file {args.list}: {e}"); exit(1)
 
 
     all_scan_results = []
-    results_lock = threading.Lock() # Lock for safely appending results
+    results_lock = threading.Lock()
 
-    # Decide whether to use threading
     use_threading = args.list and args.threads > 1 and len(targets) > 1
+    # Determine if Shodan should actually be checked (flag + valid key)
+    check_shodan = args.shodan and shodan_api_key
 
     if use_threading:
         print(f"[*] Starting scan with {args.threads} threads...")
@@ -904,14 +1073,14 @@ def main():
 
         threads = []
         for i in range(args.threads):
-            # Pass args.waf and args.verbose to the worker
-            thread = threading.Thread(target=scan_target_worker, args=(target_queue, all_scan_results, results_lock, args.waf, args.verbose), name=f"Worker-{i+1}")
+            # Pass the *actual* key if check_shodan is true, else None
+            shodan_key_to_pass = shodan_api_key if check_shodan else None
+            thread = threading.Thread(target=scan_target_worker, args=(target_queue, all_scan_results, results_lock, args.waf, shodan_key_to_pass, args.verbose), name=f"Worker-{i+1}")
             thread.daemon = True
             threads.append(thread)
             thread.start()
 
-        target_queue.join() # Wait for queue to be empty
-
+        target_queue.join()
         print("[*] Threaded scan complete.")
 
     else:
@@ -920,55 +1089,66 @@ def main():
         for target_url in targets:
             target_display = target_url[:50] + "..." if len(target_url) > 50 else target_url
 
-            headers, html_content, final_url, cookies, status_code = make_request(target_url, args.verbose) # Pass verbose
+            headers, html_content, final_url, cookies, status_code = make_request(target_url, args.verbose)
 
             current_result = {
                 'Target URL': target_url,
                 'Final URL': final_url if final_url else target_url,
                 'Status Code': status_code,
-                'CMS': [], 'Backend': [], 'Frontend': [], 'WAF': [],
-                'WAF_Checked': args.waf # Track if WAF check was requested
+                'CMS': [], 'Backend': [], 'Frontend': [], 'WAF': [], 'Shodan': None, # Init Shodan
+                'WAF_Checked': args.waf,
+                'Shodan_Checked': check_shodan # Track if Shodan check was requested and key was valid
             }
 
             is_error_status = status_code is None or not isinstance(status_code, int) or status_code >= 400
             no_content = not headers and not html_content
 
-            # Run WAF check if requested
+            # --- Run Optional Checks ---
             if args.waf:
-                # Pass original URL to wafw00f
                 current_result['WAF'] = run_wafw00f(target_url, args.verbose)
 
-            # Perform other detections
+            shodan_ip_address = None # Track IP used for Shodan
+            if check_shodan: # Only run if flag is set AND key is valid
+                try:
+                    hostname_to_resolve = urlparse(final_url if final_url else target_url).hostname
+                    if hostname_to_resolve:
+                        shodan_ip_address = socket.gethostbyname(hostname_to_resolve)
+                        current_result['Shodan'] = query_shodan(shodan_ip_address, shodan_api_key, args.verbose)
+                    elif args.verbose: print(f"[!] [{target_display}] Could not extract hostname for Shodan lookup.")
+                except socket.gaierror as e:
+                    if args.verbose: print(f"[!] [{target_display}] DNS resolution failed for Shodan lookup: {e}")
+                except Exception as e:
+                     if args.verbose: print(f"[!] [{target_display}] Error during DNS resolution for Shodan: {e}")
+                # No need to add IP if query fails, query_shodan returns None now
+
+
+            # --- Perform Core Detections ---
             if is_error_status:
                 if not no_content:
-                     # Pass verbose flag
                      current_result['CMS'] = detect_cms(headers, html_content, target_url, cookies, args.verbose)
                      current_result['Backend'] = detect_backend(headers, cookies, target_url, args.verbose)
                      current_result['Frontend'] = detect_frontend(html_content, target_url, args.verbose)
             else:
-                 # Pass verbose flag
                  current_result['CMS'] = detect_cms(headers, html_content, target_url, cookies, args.verbose)
                  current_result['Backend'] = detect_backend(headers, cookies, target_url, args.verbose)
                  current_result['Frontend'] = detect_frontend(html_content, target_url, args.verbose)
 
             all_scan_results.append(current_result)
 
-            # Display results immediately if not saving to file
             if not output_filename:
                 display_terminal(current_result)
 
     # --- Output Results ---
-    # Sort results by original target list order for consistent output if threading was used
     if use_threading:
         target_order = {url: i for i, url in enumerate(targets)}
         all_scan_results.sort(key=lambda res: target_order.get(res.get('Target URL'), float('inf')))
 
 
-    if output_filename: # Use updated filename variable
+    if output_filename:
         save_excel(all_scan_results, output_filename)
-    elif not use_threading: # Only print final summary if not threading (already printed per target)
+    elif not use_threading:
         print(f"\n[*] Scan finished for {len(targets)} target(s).")
-    else: # If threading and no output file, print all results now
+    else:
          print("\n--- Scan Complete ---")
          print("[*] Displaying results for all targets:")
          for result in all_scan_results:
